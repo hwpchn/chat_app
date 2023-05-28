@@ -1,6 +1,7 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 from rest_auth.serializers import LoginSerializer as RestAuthLoginSerializer
+from .models import FriendRequest
 
 
 class CustomLoginSerializer(RestAuthLoginSerializer):
@@ -32,3 +33,9 @@ class UserSerializer(serializers.ModelSerializer):
         validated_data['username'] = username
         user = get_user_model().objects.create_user(**validated_data)
         return user
+
+
+class FriendRequestSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FriendRequest
+        fields = ('id', 'from_user', 'to_user', 'status')
