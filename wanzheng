@@ -1,0 +1,308 @@
+代码内容和结构
+
+```
+
+my_project/
+
+│
+
+├─ config.py
+
+│
+
+├─ models/
+
+│   ├─ __init__.py
+
+│   ├─ base.py
+
+│   ├─ user_profile.py
+
+│   └─ user_auth.py
+
+│
+
+├─ services/
+
+│   ├─ __init__.py
+
+│   ├─ auth.py
+
+│   └─ user.py
+
+│
+
+├─ main.py
+
+│
+
+└─ requirements.txt
+
+```
+
+`config.py`:
+
+```python
+
+DATABASE_URL = "sqlite:///users.db"
+
+JWT_SECRET_KEY = "your_secret_key_here"
+
+MAX_LOGIN_ATTEMPTS = 5
+
+COOLDOWN_PERIOD = 24 * 60 * 60  # 24 hours in seconds
+
+```
+
+models/base.py:
+
+```python
+
+from peewee import Model
+
+from playhouse.db_url import connect
+
+import config
+
+db = connect(config.DATABASE_URL)
+
+class BaseModel(Model):
+
+    class Meta:
+
+        database = db
+
+```
+
+models/user_profile.py:
+
+```python
+
+from peewee import CharField, TextField
+
+from .base import BaseModel
+
+class UserProfile(BaseModel):
+
+    nickname = CharField()
+
+    avatar = TextField(null=True)
+
+```
+
+models/user_auth.py:
+
+```python
+
+from peewee import CharField, ForeignKeyField, DateTimeField, IntegerField
+
+from .base import BaseModel
+
+from .user_profile import UserProfile
+
+import config
+
+class UserAuth(BaseModel):
+
+    user = ForeignKeyField(UserProfile, backref="auths")
+
+    auth_type = CharField()  # 例如："email", "phone", "wechat", "google"
+
+    identifier = CharField()  # 例如：电子邮件地址、电话号码、微信OpenID或GoogleID
+
+    password = CharField(null=True)  # 只有站内用户才有密码
+
+    token = CharField(null=True)  # 第三方应用的用户存储token
+
+    login_attempts = IntegerField(default=0)
+
+    last_attempt_time = DateTimeField(null=True)
+
+```
+
+services/auth.py:
+
+```python
+
+import jwt
+
+import config
+
+def create_jwt_token(user_id: int):
+
+    token = jwt.encode({"user_id": user_id}, config.JWT_SECRET_KEY, algorithm="HS256")
+
+    return token
+
+def decode_jwt_token(token: str):
+
+    decoded_token = jwt.decode(token, config.JWT_SECRET_KEY, algorithms=["HS256"])
+
+    return decoded_token
+
+```
+
+services/user.py:
+
+```python
+
+from models.user_auth import UserAuth
+
+from models.user_profile import UserProfile
+
+import config
+
+from datetime import datetime, timedelta
+
+def register_user(auth_type, identifier, password=None, token=None, nickname=""):
+
+    user_profile = UserProfile.create(nickname=nickname)
+
+    user_auth = UserAuth.create(
+
+        user=user_profile,
+
+        auth_type=auth_type,
+
+        identifier=identifier,
+
+        password=password,
+
+        token=token,
+
+    )
+
+    return user_auth
+
+def login_user(auth_type, identifier, password=None, token=None):
+
+    user_auth = UserAuth.get_or_none(
+
+        UserAuth.auth_type == auth_type, UserAuth.identifier == identifier
+
+    )
+
+    if not user_auth:
+
+        return {"error": "User not found"}
+
+    if user_auth.auth_type in ["email", "phone"]:
+
+        if not user_auth.password:
+
+            return {"error": "Password is required"}
+
+        if user_auth.password != password:
+
+            if user_auth.login_attempts >= config.MAX_LOGIN_ATTEMPTS:
+
+                if user_auth.last_attempt_time and user_auth.last_attempt_time > datetime.now() - timedelta(seconds=config.COOLDOWN_PERIOD):
+
+                    return {"error": "Account locked, please try again later"}
+
+            user_auth.login_attempts += 1
+
+            user_auth.last_attempt_time = datetime.now()
+
+            user_auth.save()
+
+            return {"error": "Invalid password"}
+
+        user_auth.login_attempts = 0
+
+        user_auth.last_attempt_time = None
+
+        user_auth.save()
+
+    elif user_auth.auth_type in ["wechat", "google"]:
+
+        if not user_auth.token:
+
+            return {"error": "Token is required"}
+
+        if user_auth.token != token:
+
+            return {"error": "Invalid token"}
+
+    return user_auth.user
+
+```
+
+`main.py`:
+
+```python
+
+from fastapi import FastAPI, Depends, HTTPException
+
+from models import UserProfile, UserAuth
+
+from services import auth, user
+
+from fastapi.security import OAuth2PasswordBearer
+
+app = FastAPI()
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+@app.post("/register")
+
+def register(auth_type: str, identifier: str, password: str = None, token: str = None, nickname: str = ""):
+
+    user_auth = user.register_user(auth_type, identifier, password, token, nickname)
+
+    return {"user_id": user_auth.user.id}
+
+@app.post("/login")
+
+def login(auth_type: str, identifier: str, password: str = None, token: str = None):
+
+    user_profile = user.login_user(auth_type, identifier, password, token)
+
+    if "error" in user_profile:
+
+        raise HTTPException(status_code=400, detail=user_profile["error"])
+
+    jwt_token = auth.create_jwt_token(user_profile.id)
+
+    return {"access_token": jwt_token, "token_type": "bearer"}
+
+@app.get("/user/me")
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+
+    decoded_token = auth.decode_jwt_token(token)
+
+    user_id = decoded_token["user_id"]
+
+    user_profile = UserProfile.get_or_none(UserProfile.id == user_id)
+
+    if not user_profile:
+
+        raise HTTPException(status_code=400, detail="User not found")
+
+    return user_profile
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+```
+
+`requirements.txt`:
+
+```
+
+fastapi
+
+uvicorn
+
+peewee
+
+pyjwt
+
+playhouse
+
+```
+
