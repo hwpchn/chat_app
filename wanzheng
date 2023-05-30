@@ -48,6 +48,7 @@ def jwt_required(handler_func):
 ```
 
 ```python
+#config.ini
 [database]
 name = user_auth.db
 
@@ -57,25 +58,43 @@ token_expiration_time = 86400
 
 [server]
 port = 8888
+
+[EMAIL]
+smtp_server = smtp.163.com
+smtp_port = 465
+smtp_username = 13692839895@163.com
+smtp_password = UZQBUPNATCMGAQIA
+default_subject = Your default subject
+default_content = Your default content
+
+[PASSWORD_RESET]
+expiration_minutes = 10
+
 ```
 
 ```python
 # handlers.py
 import jwt
 import tornado
-from tornado.escape import json_decode
 from models import User, UserAuth, db
-from datetime import datetime, timedelta
-from peewee import IntegrityError, DoesNotExist
+from peewee import IntegrityError
 import configparser
 from werkzeug.security import generate_password_hash, check_password_hash
 from auth import jwt_required
+from datetime import datetime, timedelta
+from peewee import DoesNotExist
+from tornado.escape import json_decode
+from email_utils import send_email
+from models import User, UserAuth, ResetPassword
+import random
+import string
 
 config = configparser.ConfigParser()
 config.read('config.ini')
 
 SECRET_KEY = config['app']['secret_key']
 TOKEN_EXPIRATION_TIME = int(config['app']['token_expiration_time'])
+expiration = config.getint('PASSWORD_RESET', 'expiration_minutes')
 
 
 class RegisterHandler(tornado.web.RequestHandler):
@@ -279,6 +298,75 @@ class ChangeEmailHandler(tornado.web.RequestHandler):
             self.set_status(400)
             self.write({"error": "This email has already been taken"})
 
+
+class ForgotPasswordHandler(tornado.web.RequestHandler):
+    async def post(self):
+        data = json_decode(self.request.body)
+        email = data.get("email", None)
+        try:
+            user_auth = UserAuth.get(UserAuth.identifier == email, UserAuth.auth_type == 'email')
+        except DoesNotExist:
+            self.set_status(404)
+            self.write({"error": "Email not found"})
+            return
+
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        expires_at = datetime.now() + timedelta(minutes=10)
+
+        ResetPassword.create(user=user_auth.user, code=code, expires_at=expires_at)
+
+        # 在这里发送邮件，我使用了一个简单的文本模板，你可以根据需要自定义这个模板
+        email_content = f"Your reset code is: {code}"
+        send_email(email, "Reset Password", email_content)
+
+        self.write({"message": "Reset code sent to email"})
+
+
+import json
+from datetime import datetime
+from peewee import DoesNotExist
+from tornado.web import RequestHandler
+from werkzeug.security import generate_password_hash
+
+
+class ResetPasswordHandler(RequestHandler):
+    async def post(self):
+        data = json.loads(self.request.body)
+        email = data.get("email", None)
+        code = data.get("code", None)
+        new_password = data.get("new_password", None)
+
+        try:
+            user_auth = UserAuth.get(UserAuth.identifier == email, UserAuth.auth_type == 'email')
+            reset_password = ResetPassword.get(ResetPassword.user == user_auth.user, ResetPassword.code == code)
+        except DoesNotExist:
+            self.set_status(404)
+            self.write({"error": "Email not found or invalid code"})
+            return
+
+        if reset_password.expires_at < datetime.now():
+            self.set_status(400)
+            self.write({"error": "Code expired"})
+            return
+
+        # 更新用户密码
+        user = user_auth.user
+        hashed_password = generate_password_hash(new_password)
+        user.password = hashed_password
+        user_auth.password = hashed_password
+
+        # 更新验证信息
+        now = datetime.now()
+        user.updated_at = now
+        user_auth.updated_at = now
+
+        # 保存更新
+        user.save()
+        user_auth.save()
+        reset_password.delete_instance()
+
+        # 返回成功消息
+        self.write({"message": "Password reset successful"})
 ```
 
 ```python
@@ -286,11 +374,12 @@ class ChangeEmailHandler(tornado.web.RequestHandler):
 import tornado.web
 import tornado.ioloop
 from handlers import RegisterHandler, LoginHandler, ChangeAvatarHandler, DeleteAvatarHandler, ChangePhoneHandler, \
-    ChangeNicknameHandler
+    ChangeNicknameHandler, ChangeEmailHandler, ResetPasswordHandler, ForgotPasswordHandler
 import configparser
 
 config = configparser.ConfigParser()
 config.read('config.ini')
+port = config.get('server', 'port')
 
 
 def make_app():
@@ -301,12 +390,15 @@ def make_app():
         (r"/delete_avatar", DeleteAvatarHandler),
         (r"/change_phone", ChangePhoneHandler),
         (r"/change_nickname", ChangeNicknameHandler),
+        (r"/change_email", ChangeEmailHandler),
+        (r"/request_password_reset", ForgotPasswordHandler),
+        (r"/reset_password", ResetPasswordHandler),
     ])
 
 
 if __name__ == "__main__":
     app = make_app()
-    app.listen(8888)
+    app.listen(int(port))
     tornado.ioloop.IOLoop.current().start()
 ```
 
@@ -381,8 +473,44 @@ class UserAuth(BaseModel):
             (('auth_type', 'identifier'), True),
         )
 
+class ResetPassword(BaseModel):
+    user = ForeignKeyField(User, backref='reset_passwords')
+    code = CharField(max_length=4)
+    expires_at = DateTimeField()
 
 db.connect()
-db.create_tables([User, UserAuth])
+db.create_tables([User, UserAuth,ResetPassword])
 ```
 
+```python
+email_utils.py
+
+import smtplib
+from email.mime.text import MIMEText
+from configparser import ConfigParser
+
+
+def send_email(to_addr, subject=None, content=None):
+    config = ConfigParser()
+    config.read('config.ini')
+    smtp_server = config.get('EMAIL', 'smtp_server')
+    smtp_port = config.get('EMAIL', 'smtp_port')
+    smtp_username = config.get('EMAIL', 'smtp_username')
+    smtp_password = config.get('EMAIL', 'smtp_password')
+    default_subject = config.get('EMAIL', 'default_subject')
+    default_content = config.get('EMAIL', 'default_content')
+
+    subject = subject if subject else default_subject
+    content = content if content else default_content
+
+    msg = MIMEText(content, 'plain', 'utf-8')
+    msg['From'] = smtp_username
+    msg['To'] = to_addr
+    msg['Subject'] = subject
+
+    server = smtplib.SMTP_SSL(smtp_server, int(smtp_port))
+    server.login(smtp_username, smtp_password)
+    server.sendmail(smtp_username, [to_addr], msg.as_string())
+    server.quit()
+
+```
