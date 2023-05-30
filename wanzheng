@@ -1,308 +1,388 @@
-代码内容和结构
-
-```
-
-my_project/
-
-│
-
-├─ config.py
-
-│
-
-├─ models/
-
-│   ├─ __init__.py
-
-│   ├─ base.py
-
-│   ├─ user_profile.py
-
-│   └─ user_auth.py
-
-│
-
-├─ services/
-
-│   ├─ __init__.py
-
+```python
+project_root/
+├─ app/
+│   ├─ models.py
+│   ├─ handlers.py
 │   ├─ auth.py
-
-│   └─ user.py
-
-│
-
-├─ main.py
-
-│
-
+│   └─ main.py
 └─ requirements.txt
-
 ```
 
-`config.py`:
-
 ```python
-
-DATABASE_URL = "sqlite:///users.db"
-
-JWT_SECRET_KEY = "your_secret_key_here"
-
-MAX_LOGIN_ATTEMPTS = 5
-
-COOLDOWN_PERIOD = 24 * 60 * 60  # 24 hours in seconds
-
-```
-
-models/base.py:
-
-```python
-
-from peewee import Model
-
-from playhouse.db_url import connect
-
-import config
-
-db = connect(config.DATABASE_URL)
-
-class BaseModel(Model):
-
-    class Meta:
-
-        database = db
-
-```
-
-models/user_profile.py:
-
-```python
-
-from peewee import CharField, TextField
-
-from .base import BaseModel
-
-class UserProfile(BaseModel):
-
-    nickname = CharField()
-
-    avatar = TextField(null=True)
-
-```
-
-models/user_auth.py:
-
-```python
-
-from peewee import CharField, ForeignKeyField, DateTimeField, IntegerField
-
-from .base import BaseModel
-
-from .user_profile import UserProfile
-
-import config
-
-class UserAuth(BaseModel):
-
-    user = ForeignKeyField(UserProfile, backref="auths")
-
-    auth_type = CharField()  # 例如："email", "phone", "wechat", "google"
-
-    identifier = CharField()  # 例如：电子邮件地址、电话号码、微信OpenID或GoogleID
-
-    password = CharField(null=True)  # 只有站内用户才有密码
-
-    token = CharField(null=True)  # 第三方应用的用户存储token
-
-    login_attempts = IntegerField(default=0)
-
-    last_attempt_time = DateTimeField(null=True)
-
-```
-
-services/auth.py:
-
-```python
-
+# auth.py
 import jwt
+import functools
+from jwt.exceptions import InvalidTokenError
+from models import User
+from tornado.web import HTTPError
+import configparser
 
-import config
+config = configparser.ConfigParser()
+config.read('config.ini')
 
-def create_jwt_token(user_id: int):
+SECRET_KEY = config['app']['secret_key']
 
-    token = jwt.encode({"user_id": user_id}, config.JWT_SECRET_KEY, algorithm="HS256")
 
-    return token
+def jwt_required(handler_func):
+    @functools.wraps(handler_func)
+    async def wrapper(handler, *args, **kwargs):
+        auth_header = handler.request.headers.get("Authorization")
+        if not auth_header or "Bearer" not in auth_header:
+            raise HTTPError(status_code=401, reason="Missing or invalid token")
 
-def decode_jwt_token(token: str):
+        token = auth_header.split(" ")[1]
+        try:
+            decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            user_id = decoded.get("user_id")
+            user = User.get_or_none(User.id == user_id)
 
-    decoded_token = jwt.decode(token, config.JWT_SECRET_KEY, algorithms=["HS256"])
+            if not user:
+                raise HTTPError(status_code=401, reason="Invalid token")
+        except InvalidTokenError:
+            raise HTTPError(status_code=401, reason="Invalid token")
 
-    return decoded_token
+        handler.current_user = user
+        return await handler_func(handler, *args, **kwargs)
 
+    return wrapper
 ```
 
-services/user.py:
+```python
+[database]
+name = user_auth.db
+
+[app]
+secret_key = replace_with_your_secret_key
+token_expiration_time = 86400
+
+[server]
+port = 8888
+```
 
 ```python
-
-from models.user_auth import UserAuth
-
-from models.user_profile import UserProfile
-
-import config
-
+# handlers.py
+import jwt
+import tornado
+from tornado.escape import json_decode
+from models import User, UserAuth, db
 from datetime import datetime, timedelta
+from peewee import IntegrityError, DoesNotExist
+import configparser
+from werkzeug.security import generate_password_hash, check_password_hash
+from auth import jwt_required
 
-def register_user(auth_type, identifier, password=None, token=None, nickname=""):
+config = configparser.ConfigParser()
+config.read('config.ini')
 
-    user_profile = UserProfile.create(nickname=nickname)
+SECRET_KEY = config['app']['secret_key']
+TOKEN_EXPIRATION_TIME = int(config['app']['token_expiration_time'])
 
-    user_auth = UserAuth.create(
 
-        user=user_profile,
+class RegisterHandler(tornado.web.RequestHandler):
+    async def post(self):
+        data = json_decode(self.request.body)
+        email = data.get('email')
+        phone = data.get('phone')
+        wechat = data.get('wechat')
+        password = data.get('password')
 
-        auth_type=auth_type,
+        if email:
+            auth_type = 'email'
+            identifier = email
+            existing_user = User.get_or_none(User.email == email)
+        elif phone:
+            auth_type = 'phone'
+            identifier = phone
+            existing_user = User.get_or_none(User.phone == phone)
+        elif wechat:
+            auth_type = 'wechat'
+            identifier = wechat
+            existing_user = User.get_or_none(User.nickname == wechat)
+        else:
+            self.set_status(400)
+            self.write({'error': 'Invalid registration data'})
+            return
 
-        identifier=identifier,
+        if existing_user:
+            self.set_status(400)
+            self.write({'error': 'A user with this identifier already exists'})
+            return
 
-        password=password,
+        try:
+            with db.atomic():
+                hashed_password = generate_password_hash(password)  # Hash the password here
+                user = User.create(
+                    nickname=identifier,
+                    email=email if auth_type == 'email' else None,
+                    phone=phone if auth_type == 'phone' else None,
+                    password=hashed_password
+                )
+                UserAuth.create(user=user, auth_type=auth_type, identifier=identifier, credential=hashed_password)
+                self.write({"user_id": user.id, "nickname": user.nickname, "avatar": user.avatar,
+                            "created_at": user.created_at.isoformat()})
+        except IntegrityError as e:
+            self.set_status(400)
+            self.write({'error': str(e)})
 
-        token=token,
 
-    )
+class LoginHandler(tornado.web.RequestHandler):
+    async def post(self):
+        data = json_decode(self.request.body)
+        email = data.get('email')
+        phone = data.get('phone')
+        wechat = data.get('wechat')
+        password = data.get('password')
 
-    return user_auth
+        if email:
+            auth_type = 'email'
+            identifier = email
+        elif phone:
+            auth_type = 'phone'
+            identifier = phone
+        elif wechat:
+            auth_type = 'wechat'
+            identifier = wechat
+        else:
+            self.set_status(400)
+            self.write({'error': 'Invalid login data'})
+            return
 
-def login_user(auth_type, identifier, password=None, token=None):
+        try:
+            user_auth = UserAuth.get(UserAuth.auth_type == auth_type, UserAuth.identifier == identifier)
+            user = user_auth.user
+            if auth_type != 'wechat':
+                if check_password_hash(user.password, password):
+                    token = jwt.encode(
+                        {"user_id": user.id, "exp": datetime.utcnow() + timedelta(seconds=TOKEN_EXPIRATION_TIME)},
+                        SECRET_KEY, algorithm="HS256")
+                    self.write({"user_id": user.id, "nickname": user.nickname, "avatar": user.avatar,
+                                "created_at": user.created_at.isoformat(), "token": token})
+                else:
+                    self.set_status(401)
+                    self.write({"error": "Invalid credentials"})
+            else:
+                token = jwt.encode(
+                    {"user_id": user.id, "exp": datetime.utcnow() + timedelta(seconds=TOKEN_EXPIRATION_TIME)},
+                    SECRET_KEY, algorithm="HS256")
+                self.write({"user_id": user.id, "nickname": user.nickname, "avatar": user.avatar,
+                            "created_at": user.created_at.isoformat(), "token": token})
+        except UserAuth.DoesNotExist:
+            self.set_status(401)
+            self.write({"error": "User not found"})
 
-    user_auth = UserAuth.get_or_none(
 
-        UserAuth.auth_type == auth_type, UserAuth.identifier == identifier
+class ChangeNicknameHandler(tornado.web.RequestHandler):
+    @jwt_required
+    async def post(self):
+        data = json_decode(self.request.body)
+        new_nickname = data.get('new_nickname')
 
-    )
+        try:
+            with db.atomic():
+                self.current_user.nickname = new_nickname
+                self.current_user.updated_at = datetime.now()
+                self.current_user.save()
 
-    if not user_auth:
+                self.write({"message": "Nickname updated successfully"})
+        except IntegrityError:
+            self.set_status(400)
+            self.write({"error": "This nickname has already been taken"})
 
-        return {"error": "User not found"}
 
-    if user_auth.auth_type in ["email", "phone"]:
+class ChangeAvatarHandler(tornado.web.RequestHandler):
+    @jwt_required
+    async def post(self):
+        data = json_decode(self.request.body)
+        new_avatar = data.get('new_avatar')
 
-        if not user_auth.password:
+        try:
+            with db.atomic():
+                self.current_user.avatar = new_avatar
+                self.current_user.updated_at = datetime.now()
+                self.current_user.save()
 
-            return {"error": "Password is required"}
+                self.write({"message": "Avatar updated successfully"})
+        except Exception as e:
+            self.set_status(400)
+            self.write({'error': str(e)})
 
-        if user_auth.password != password:
 
-            if user_auth.login_attempts >= config.MAX_LOGIN_ATTEMPTS:
+class DeleteAvatarHandler(tornado.web.RequestHandler):
+    @jwt_required
+    async def post(self):
+        try:
+            with db.atomic():
+                self.current_user.avatar = None
+                self.current_user.updated_at = datetime.now()
+                self.current_user.save()
 
-                if user_auth.last_attempt_time and user_auth.last_attempt_time > datetime.now() - timedelta(seconds=config.COOLDOWN_PERIOD):
+                self.write({"message": "Avatar deleted successfully"})
+        except Exception as e:
+            self.set_status(400)
+            self.write({'error': str(e)})
 
-                    return {"error": "Account locked, please try again later"}
 
-            user_auth.login_attempts += 1
+class ChangePhoneHandler(tornado.web.RequestHandler):
+    @jwt_required
+    async def post(self):
+        data = json_decode(self.request.body)
+        new_phone = data.get('new_phone')
 
-            user_auth.last_attempt_time = datetime.now()
+        try:
+            with db.atomic():
+                # Get user's credential for auth_type 'email'
+                user_auth_email = UserAuth.get(user=self.current_user, auth_type='email')
 
-            user_auth.save()
+                user_auth_phone, created = UserAuth.get_or_create(
+                    auth_type='phone', user=self.current_user,
+                    defaults={'identifier': new_phone, 'credential': user_auth_email.credential})
+                if not created:
+                    user_auth_phone.identifier = new_phone
+                user_auth_phone.updated_at = datetime.now()
+                user_auth_phone.save()
 
-            return {"error": "Invalid password"}
+                self.current_user.phone = new_phone
+                self.current_user.updated_at = datetime.now()
+                self.current_user.save()
 
-        user_auth.login_attempts = 0
+                self.write({"message": "Phone number updated successfully"})
+        except IntegrityError:
+            self.set_status(400)
+            self.write({"error": "This phone number has already been taken"})
 
-        user_auth.last_attempt_time = None
 
-        user_auth.save()
+class ChangeEmailHandler(tornado.web.RequestHandler):
+    @jwt_required
+    async def post(self):
+        data = json_decode(self.request.body)
+        new_email = data.get('new_email')
 
-    elif user_auth.auth_type in ["wechat", "google"]:
+        try:
+            with db.atomic():
+                # Get user's credential for auth_type 'phone'
+                user_auth_phone = UserAuth.get(user=self.current_user, auth_type='phone')
 
-        if not user_auth.token:
+                user_auth_email, created = UserAuth.get_or_create(
+                    auth_type='email', user=self.current_user,
+                    defaults={'identifier': new_email, 'credential': user_auth_phone.credential})
+                if not created:
+                    user_auth_email.identifier = new_email
+                user_auth_email.updated_at = datetime.now()
+                user_auth_email.save()
 
-            return {"error": "Token is required"}
+                self.current_user.email = new_email
+                self.current_user.updated_at = datetime.now()
+                self.current_user.save()
 
-        if user_auth.token != token:
-
-            return {"error": "Invalid token"}
-
-    return user_auth.user
+                self.write({"message": "Email updated successfully"})
+        except IntegrityError:
+            self.set_status(400)
+            self.write({"error": "This email has already been taken"})
 
 ```
 
-`main.py`:
-
 ```python
+# main.py
+import tornado.web
+import tornado.ioloop
+from handlers import RegisterHandler, LoginHandler, ChangeAvatarHandler, DeleteAvatarHandler, ChangePhoneHandler, \
+    ChangeNicknameHandler
+import configparser
 
-from fastapi import FastAPI, Depends, HTTPException
+config = configparser.ConfigParser()
+config.read('config.ini')
 
-from models import UserProfile, UserAuth
 
-from services import auth, user
+def make_app():
+    return tornado.web.Application([
+        (r"/register", RegisterHandler),
+        (r"/login", LoginHandler),
+        (r"/change_avatar", ChangeAvatarHandler),
+        (r"/delete_avatar", DeleteAvatarHandler),
+        (r"/change_phone", ChangePhoneHandler),
+        (r"/change_nickname", ChangeNicknameHandler),
+    ])
 
-from fastapi.security import OAuth2PasswordBearer
-
-app = FastAPI()
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-@app.post("/register")
-
-def register(auth_type: str, identifier: str, password: str = None, token: str = None, nickname: str = ""):
-
-    user_auth = user.register_user(auth_type, identifier, password, token, nickname)
-
-    return {"user_id": user_auth.user.id}
-
-@app.post("/login")
-
-def login(auth_type: str, identifier: str, password: str = None, token: str = None):
-
-    user_profile = user.login_user(auth_type, identifier, password, token)
-
-    if "error" in user_profile:
-
-        raise HTTPException(status_code=400, detail=user_profile["error"])
-
-    jwt_token = auth.create_jwt_token(user_profile.id)
-
-    return {"access_token": jwt_token, "token_type": "bearer"}
-
-@app.get("/user/me")
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-
-    decoded_token = auth.decode_jwt_token(token)
-
-    user_id = decoded_token["user_id"]
-
-    user_profile = UserProfile.get_or_none(UserProfile.id == user_id)
-
-    if not user_profile:
-
-        raise HTTPException(status_code=400, detail="User not found")
-
-    return user_profile
 
 if __name__ == "__main__":
-
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    app = make_app()
+    app.listen(8888)
+    tornado.ioloop.IOLoop.current().start()
 ```
 
-`requirements.txt`:
+```python
+# models.py
+import peewee as pw
+from datetime import datetime
+from peewee import Model, SqliteDatabase, CharField, AutoField, DateTimeField, ForeignKeyField
+from werkzeug.security import generate_password_hash, check_password_hash
+import configparser
 
-```
+config = configparser.ConfigParser()
+config.read('config.ini')
 
-fastapi
+db = SqliteDatabase(config['database']['name'])
 
-uvicorn
 
-peewee
+class BaseModel(Model):
+    class Meta:
+        database = db
 
-pyjwt
 
-playhouse
+class User(BaseModel):
+    id = AutoField()
+    nickname = CharField(max_length=100)
+    email = pw.CharField(max_length=255, unique=True, null=True)
+    phone = pw.CharField(max_length=20, unique=True, null=True)
+    password = pw.CharField(max_length=255)
+    avatar = CharField(max_length=255, null=True)
+    created_at = DateTimeField(default=datetime.now)
+    updated_at = DateTimeField(null=True)
 
+    def set_avatar(self, avatar_url):
+        self.avatar = avatar_url
+        self.save()
+
+    def delete_avatar(self):
+        self.avatar = None
+        self.save()
+
+    def change_phone(self, new_phone):
+        self.phone = new_phone
+        self.save()
+
+    def change_nickname(self, new_nickname):
+        self.nickname = new_nickname
+        self.save()
+
+
+class UserAuth(BaseModel):
+    id = AutoField()
+    user = ForeignKeyField(User, backref='auths')
+    auth_type = pw.CharField(max_length=20)
+    identifier = pw.CharField(max_length=255)
+    credential = CharField(max_length=255)
+    created_at = DateTimeField(default=datetime.now)
+    updated_at = DateTimeField(null=True)
+
+    def set_password(self, password: str):
+        self.credential = generate_password_hash(password)
+
+    def verify_password(self, password: str):
+        return check_password_hash(self.credential, password)
+
+    def check_password(self, password):
+        return check_password_hash(self.credential, password)
+
+    class Meta:
+        # ... your existing code ...
+        indexes = (
+            # Create a unique index on auth_type + identifier
+            (('auth_type', 'identifier'), True),
+        )
+
+
+db.connect()
+db.create_tables([User, UserAuth])
 ```
 
